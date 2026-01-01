@@ -21,25 +21,25 @@ NPY_DIR = Path("paramDSD")
 RADIAL_BIN_KM = 5.0
 RADIUS_INNER_KM = 25.0
 RADIUS_OUTER_KM = 75.0
-BIN_START = 131
-BIN_END = 179
+HEIGHT_TOP_KM = 6.0
+BIN_INTERVAL_M = 125.0
 
 SWATH_COL = "swath"
 GRANULE_COL = "granule_file"
 
 OUT_COLS = [
-    "nw_mean_r0_75_b131_179",
-    "nw_std_r0_75_b131_179",
-    "nw_max_r0_75_b131_179",
-    "dm_mean_r0_75_b131_179",
-    "dm_std_r0_75_b131_179",
-    "dm_max_r0_75_b131_179",
-    "nw_mean_r25_75_b131_179",
-    "nw_std_r25_75_b131_179",
-    "nw_max_r25_75_b131_179",
-    "dm_mean_r25_75_b131_179",
-    "dm_std_r25_75_b131_179",
-    "dm_max_r25_75_b131_179",
+    "nw_mean_r0_75_h0_6km",
+    "nw_std_r0_75_h0_6km",
+    "nw_max_r0_75_h0_6km",
+    "dm_mean_r0_75_h0_6km",
+    "dm_std_r0_75_h0_6km",
+    "dm_max_r0_75_h0_6km",
+    "nw_mean_r25_75_h0_6km",
+    "nw_std_r25_75_h0_6km",
+    "nw_max_r25_75_h0_6km",
+    "dm_mean_r25_75_h0_6km",
+    "dm_std_r25_75_h0_6km",
+    "dm_max_r25_75_h0_6km",
 ]
 
 
@@ -98,11 +98,13 @@ def main() -> None:
             continue
 
         n_bins = data.shape[1]
-        b0 = max(0, BIN_START)
-        b1 = min(n_bins - 1, BIN_END)
-        if b1 < b0:
-            print(f"Row {idx} skip: bin range {BIN_START}-{BIN_END} outside {n_bins}")
+        heights_km = (n_bins - 1 - np.arange(n_bins)) * (BIN_INTERVAL_M / 1000.0)
+        bin_indices = np.where(heights_km <= HEIGHT_TOP_KM)[0]
+        if bin_indices.size == 0:
+            print(f"Row {idx} skip: no bins at/under {HEIGHT_TOP_KM} km")
             continue
+        b0 = int(bin_indices.min())
+        b1 = int(bin_indices.max())
 
         nw = data[0, b0 : b1 + 1, :]
         dm = data[1, b0 : b1 + 1, :]
@@ -114,21 +116,21 @@ def main() -> None:
 
         nw_mean, nw_std, nw_max = _nan_stats(nw_vals_0_75)
         dm_mean, dm_std, dm_max = _nan_stats(dm_vals_0_75)
-        df.at[idx, "nw_mean_r0_75_b131_179"] = nw_mean
-        df.at[idx, "nw_std_r0_75_b131_179"] = nw_std
-        df.at[idx, "nw_max_r0_75_b131_179"] = nw_max
-        df.at[idx, "dm_mean_r0_75_b131_179"] = dm_mean
-        df.at[idx, "dm_std_r0_75_b131_179"] = dm_std
-        df.at[idx, "dm_max_r0_75_b131_179"] = dm_max
+        df.at[idx, "nw_mean_r0_75_h0_6km"] = nw_mean
+        df.at[idx, "nw_std_r0_75_h0_6km"] = nw_std
+        df.at[idx, "nw_max_r0_75_h0_6km"] = nw_max
+        df.at[idx, "dm_mean_r0_75_h0_6km"] = dm_mean
+        df.at[idx, "dm_std_r0_75_h0_6km"] = dm_std
+        df.at[idx, "dm_max_r0_75_h0_6km"] = dm_max
 
         nw_mean, nw_std, nw_max = _nan_stats(nw_vals_25_75)
         dm_mean, dm_std, dm_max = _nan_stats(dm_vals_25_75)
-        df.at[idx, "nw_mean_r25_75_b131_179"] = nw_mean
-        df.at[idx, "nw_std_r25_75_b131_179"] = nw_std
-        df.at[idx, "nw_max_r25_75_b131_179"] = nw_max
-        df.at[idx, "dm_mean_r25_75_b131_179"] = dm_mean
-        df.at[idx, "dm_std_r25_75_b131_179"] = dm_std
-        df.at[idx, "dm_max_r25_75_b131_179"] = dm_max
+        df.at[idx, "nw_mean_r25_75_h0_6km"] = nw_mean
+        df.at[idx, "nw_std_r25_75_h0_6km"] = nw_std
+        df.at[idx, "nw_max_r25_75_h0_6km"] = nw_max
+        df.at[idx, "dm_mean_r25_75_h0_6km"] = dm_mean
+        df.at[idx, "dm_std_r25_75_h0_6km"] = dm_std
+        df.at[idx, "dm_max_r25_75_h0_6km"] = dm_max
 
     df.to_csv(OUT_CSV, index=False)
     print(f"Wrote {OUT_CSV}")

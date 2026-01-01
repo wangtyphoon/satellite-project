@@ -30,7 +30,7 @@ import regrid_zfactorfinal as rzf
 # =====================================================
 NPY_PATH = None  # set to a specific .npy to bypass CSV lookup
 IN_CSV = "gpm_passes_swath_true.csv"
-ROW_INDEX = 5
+ROW_INDEX = 0
 NPY_DIR = "paramDSD"
 NPY_TAG = "paramDSD_radial150km.npy"
 SWATH_COL = "swath"
@@ -46,6 +46,21 @@ MAX_RADIUS_KM = 150.0  # set float to cap radius (default: half grid extent)
 
 CLIP_PERCENTILE = (2, 98)  # set None to use full min/max
 FIG_DPI = 140
+BIN_INTERVAL_M = 125.0  # range-bin thickness (meters)
+RADIAL_FEATURE_COLS = [
+    "nw_mean_r0_75_h0_6km",
+    "nw_std_r0_75_h0_6km",
+    "nw_max_r0_75_h0_6km",
+    "dm_mean_r0_75_h0_6km",
+    "dm_std_r0_75_h0_6km",
+    "dm_max_r0_75_h0_6km",
+    "nw_mean_r25_75_h0_6km",
+    "nw_std_r25_75_h0_6km",
+    "nw_max_r25_75_h0_6km",
+    "dm_mean_r25_75_h0_6km",
+    "dm_std_r25_75_h0_6km",
+    "dm_max_r25_75_h0_6km",
+]
 
 
 # =====================================================
@@ -96,7 +111,7 @@ def _radial_profile(field: np.ndarray, r_km: np.ndarray, edges: np.ndarray) -> n
     return out
 
 
-def _resolve_npy_path_from_csv() -> str:
+def _resolve_npy_path_from_csv() -> Tuple[str, pd.Series]:
     csv_path = Path(IN_CSV)
     if not csv_path.exists():
         raise FileNotFoundError(f"CSV not found: {csv_path}")
@@ -116,20 +131,43 @@ def _resolve_npy_path_from_csv() -> str:
     if swath:
         npy_path = npy_dir / f"{stem}_{swath}_{NPY_TAG}"
         if npy_path.exists():
-            return str(npy_path)
+            return str(npy_path), row
     matches = sorted(npy_dir.glob(f"{stem}_*_{NPY_TAG}"))
     if len(matches) == 1:
-        return str(matches[0])
+        return str(matches[0]), row
     raise FileNotFoundError(f"No unique npy found for row {ROW_INDEX} ({stem}).")
+
+
+def _print_radial_features(row: pd.Series) -> None:
+    values = []
+    for col in RADIAL_FEATURE_COLS:
+        if col not in row.index:
+            values.append(f"{col}=NA")
+        else:
+            val = row[col]
+            if pd.isna(val):
+                values.append(f"{col}=nan")
+            else:
+                try:
+                    values.append(f"{col}={float(val):.3f}")
+                except (TypeError, ValueError):
+                    values.append(f"{col}={val}")
+    print(f"Row {ROW_INDEX} radial features: " + ", ".join(values))
 
 
 # =====================================================
 # Main
 # =====================================================
 def main() -> None:
-    npy_path = NPY_PATH if NPY_PATH else _resolve_npy_path_from_csv()
+    row = None
+    if NPY_PATH:
+        npy_path = NPY_PATH
+    else:
+        npy_path, row = _resolve_npy_path_from_csv()
     if not os.path.exists(npy_path):
         raise FileNotFoundError(f"Missing input: {npy_path}")
+    if row is not None:
+        _print_radial_features(row)
 
     data = np.load(npy_path)
     data, n_bins = _prepare_bins(data)
@@ -140,6 +178,10 @@ def main() -> None:
     b1 = BIN_END if BIN_END is not None else n_bins
     b0 = max(0, b0)
     b1 = min(n_bins, b1)
+
+    height_km = (n_bins - 1 - np.arange(n_bins)) * (BIN_INTERVAL_M / 1000.0)
+    height_top = height_km[b0]
+    height_bottom = height_km[b1 - 1]
 
     out_dir = Path(OUT_DIR)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -177,7 +219,7 @@ def main() -> None:
     dm_lim = _limits(dm_stack, CLIP_PERCENTILE)
 
     fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
-    extent = [r_centers[0], r_centers[-1], b1 - 1, b0]
+    extent = [r_centers[0], r_centers[-1], height_bottom, height_top]
 
     ax = axes[0]
     im = ax.imshow(
@@ -189,8 +231,8 @@ def main() -> None:
         vmax=nw_lim[1],
         cmap="viridis",
     )
-    ax.set_title("NW axis-sym (radius vs height bins)")
-    ax.set_ylabel("Bin index (top -> bottom)")
+    ax.set_title("NW axis-sym (radius vs height)")
+    ax.set_ylabel("Height (km)")
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
     ax = axes[1]
@@ -203,9 +245,9 @@ def main() -> None:
         vmax=dm_lim[1],
         cmap="magma",
     )
-    ax.set_title("DM axis-sym (radius vs height bins)")
+    ax.set_title("DM axis-sym (radius vs height)")
     ax.set_xlabel("Radius from TC center (km)")
-    ax.set_ylabel("Bin index (top -> bottom)")
+    ax.set_ylabel("Height (km)")
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
 
     fig.tight_layout()

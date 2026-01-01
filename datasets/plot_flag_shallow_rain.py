@@ -230,7 +230,7 @@ def main() -> None:
     # Config (edit as needed)
     # =========================
     csv_path = Path(IN_CSV)
-    row_index = 23  # which row in gpm_passes_swath_true.csv
+    row_index = 0  # which row in gpm_passes_swath_true.csv
     file_path = None  # set to Path("...") to override the CSV selection (npy)
     swath = None  # set to "FS"/"HS" or keep None to use CSV swath
     crop_radius_km = 150.0  # stats radius around storm center
