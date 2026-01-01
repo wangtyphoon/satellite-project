@@ -21,7 +21,7 @@ def compute_r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 def main() -> None:
     # Config
     csv_path = Path("gpm_passes_swath_true.csv")
-    target = "intensity_bst"
+    target = "delta_24h"
     feature_prefix = "stormtop_"
     features = None
     outdir = Path("plots_radar_feature_target")
