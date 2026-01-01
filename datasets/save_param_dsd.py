@@ -1,18 +1,34 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Regrid zFactorFinal to a 5 km grid (100x100 over 500x500 km) and visualize it.
+Save paramDSD (NW/DM) as storm-centered regridded .npy.
+Stores all vertical bins without aggregation when present.
 """
 
-from __future__ import annotations
+# Directly reused from regrid_zfactorfinal.py:
+# - _script_dir, _project_root, normalize_swath_name, resolve_swath, find_dataset_path
+# - _to_utc_datetime, load_track_for_sid, interpolate_track_position
+# - _wrap_lon, _latlon_to_local_km, _apply_valid_range
+# - _grid_centers, _grid_swath_mask, _regrid_to_grid
+# - _infer_year_from_row, _resolve_pass_time
+#
+# Differences vs regrid_zfactorfinal.py:
+# - Dataset path uses SLV/paramDSD.
+# - Split paramDSD into NW/DM, regrid separately, stack to (2, GRID_SIZE, GRID_SIZE).
+# - No vertical aggregation; keep bins when NW/DM has a vertical dimension.
+# - Debug prints for data.shape and attribute keys after reading paramDSD.
 
+from __future__ import annotations
+import sys
 import os
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
 
 import h5py
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 
 
 IN_CSV = "gpm_passes_swath_true.csv"
@@ -27,22 +43,22 @@ PASS_END_COL = "pass_end_utc"
 SOURCE_COL = "source"
 GRANULE_COL = "granule_file"
 
-DATASET_CANDIDATES = [
-    "SLV/zFactorFinal",
-    "SLV/zFactorFinalNearSurface",
-   #"SLV/zFactorFinalESurface",
-]
-CHANNEL = 0
-VERTICAL_AGG = "mean"
+DATASET_CANDIDATES = ["SLV/paramDSD"]
 
 GRID_KM = 1
 GRID_SIZE = 490  # 100x100 over 500x500 km
 GRID_EXTENT_KM = GRID_KM * GRID_SIZE / 2.0  # 250 km
-PLOT_OUTPUT = "zfactorfinal_regrid_5km.png"
-INTERP_METHOD = "gaussian"  # bin_mean, nearest, bilinear, gaussian, barnes, cressman
+INTERP_METHOD = "gaussian"
 WEIGHT_RADIUS_KM = 7.5
 GAUSS_SIGMA_KM = 5
 BARNES_KAPPA_KM2 = 200.0
+
+# Debug/limit controls
+ROW_INDEX = 2  # set int to run a single row
+ROW_MAX = 2     # set int to process first N rows
+PRINT_EVERY_BIN = 10  # progress print interval when bin count is large
+USE_PARALLEL = False
+N_WORKERS = 1
 
 
 def _script_dir() -> str:
@@ -84,32 +100,6 @@ def find_dataset_path(h5, swath_prefix, candidates):
         if path in h5:
             return path
     return None
-
-
-def squeeze_field(data, channel):
-    if data.ndim == 2:
-        return data
-    if data.ndim == 3:
-        return data
-    if data.ndim == 4:
-        if channel < 0 or channel >= data.shape[-1]:
-            raise IndexError(f"CHANNEL {channel} out of range for data shape {data.shape}.")
-        return data[..., channel]
-    raise ValueError(f"Unsupported data shape {data.shape} for plan view.")
-
-
-def reduce_vertical(data, agg):
-    if data.ndim != 3:
-        return data
-    if agg is None:
-        raise ValueError("VERTICAL_AGG is None but data has vertical bins.")
-    if not np.isfinite(data).any():
-        return np.full(data.shape[:2], np.nan, dtype=data.dtype)
-    if agg == "max":
-        return np.nanmax(data, axis=2)
-    if agg == "mean":
-        return np.nanmean(data, axis=2)
-    raise ValueError(f"Unsupported VERTICAL_AGG {agg}.")
 
 
 def _to_utc_datetime(s):
@@ -344,13 +334,67 @@ def _resolve_pass_time(row) -> pd.Timestamp:
     raise ValueError("No pass_time_utc or pass_start_utc/pass_end_utc available.")
 
 
-def main() -> None:
-    csv_path = os.path.join(_script_dir(), IN_CSV)
-    df = pd.read_csv(csv_path)
-    if len(df) == 0:
-        raise ValueError(f"{IN_CSV} is empty.")
+def _output_path(granule_file, swath) -> str:
+    out_dir = os.path.join(_script_dir(), "paramDSD")
+    os.makedirs(out_dir, exist_ok=True)
+    stem = Path(granule_file).stem
+    return os.path.join(out_dir, f"{stem}_{swath}_paramDSD.npy")
 
-    row = df.iloc[0]
+
+def _split_param_dsd(data: np.ndarray):
+    shape = data.shape
+    dims = [i for i, s in enumerate(shape) if s == 2]
+    if len(dims) != 1:
+        raise ValueError(
+            "Cannot infer NW/DM dimension from shape "
+            f"{shape}; expected exactly one dimension of size 2, found {dims}."
+        )
+    dim = dims[0]
+    data = np.moveaxis(data, dim, -1)
+    nw = data[..., 0]
+    dm = data[..., 1]
+    return nw, dm, dim
+
+
+def _align_bins(field: np.ndarray, lat_shape: tuple) -> np.ndarray:
+    if field.ndim == 2:
+        if field.shape != lat_shape:
+            raise ValueError(f"Shape mismatch: field {field.shape}, lat {lat_shape}.")
+        return field
+    if field.ndim == 3:
+        if field.shape[:2] == lat_shape:
+            return field
+        if (field.shape[0], field.shape[2]) == lat_shape:
+            return np.swapaxes(field, 1, 2)
+        if field.shape[1:] == lat_shape:
+            return np.moveaxis(field, 0, -1)
+    raise ValueError(f"Unsupported field shape {field.shape} for lat {lat_shape}.")
+
+
+def _regrid_field(
+    field: np.ndarray,
+    x_km: np.ndarray,
+    y_km: np.ndarray,
+    valid_xy: np.ndarray,
+    swath_mask: np.ndarray,
+    step: float,
+    size: int,
+    half: float,
+) -> np.ndarray:
+    valid = valid_xy & np.isfinite(field)
+    grid = _regrid_to_grid(
+        x_km[valid],
+        y_km[valid],
+        field[valid],
+        INTERP_METHOD,
+        step,
+        size,
+        half,
+    )
+    return np.where(np.isnan(grid) & swath_mask, 0.0, grid)
+
+
+def _process_row(row, row_idx):
     year = _infer_year_from_row(row)
     granule_file = row[GRANULE_COL]
     swath_pref = normalize_swath_name(row.get(SWATH_COL, None))
@@ -380,20 +424,15 @@ def main() -> None:
         ds = h5[data_path]
         data = ds[...]
         attrs = {k: ds.attrs[k] for k in ds.attrs.keys()}
-        dataset_name = data_path.split("/")[-1]
-        dataset_idx = None
-        for i, candidate in enumerate(DATASET_CANDIDATES, start=1):
-            if data_path.endswith(candidate):
-                dataset_idx = i
-                break
-        if dataset_idx is None:
-            dataset_idx = 0
 
-    data = squeeze_field(data, CHANNEL).astype(np.float32)
+    print(f"[{row_idx}] paramDSD shape: {data.shape}")
+    print(f"[{row_idx}] paramDSD attrs: {sorted(attrs.keys())}")
+
+    data = data.astype(np.float32)
     fill = attrs.get("_FillValue", attrs.get("missing_value", None))
     if fill is not None:
         try:
-            data[np.isclose(data, float(fill))] = 0 #np.nan
+            data[np.isclose(data, float(fill))] = 0
         except Exception:
             pass
     scale = attrs.get("scale_factor", None)
@@ -403,61 +442,111 @@ def main() -> None:
         offset = float(offset) if offset is not None else 0.0
         data = data * scale + offset
     data = _apply_valid_range(data, attrs)
-    data = reduce_vertical(data, VERTICAL_AGG)
 
-    if data.shape != lat.shape:
-        raise ValueError(f"Shape mismatch: data {data.shape} vs lat {lat.shape}.")
+    nw, dm, dim = _split_param_dsd(data)
+    nw = _align_bins(nw, lat.shape)
+    dm = _align_bins(dm, lat.shape)
 
     lat[(lat < -90.0) | (lat > 90.0)] = np.nan
     lon[(lon < -180.0) | (lon > 180.0)] = np.nan
     x_km, y_km = _latlon_to_local_km(lat, lon, storm_lat, storm_lon)
     valid_xy = np.isfinite(x_km) & np.isfinite(y_km)
-    valid = valid_xy & np.isfinite(data)
 
     half = GRID_EXTENT_KM
     step = GRID_KM
     swath_mask = _grid_swath_mask(x_km[valid_xy], y_km[valid_xy], step, GRID_SIZE, half)
-    grid_mean = _regrid_to_grid(
-        x_km[valid],
-        y_km[valid],
-        data[valid],
-        INTERP_METHOD,
-        step,
-        GRID_SIZE,
-        half,
-    )
-    grid_mean = np.where(np.isnan(grid_mean) & swath_mask, 0.0, grid_mean)
-    out_dir = os.path.join(_script_dir(), dataset_name)
-    os.makedirs(out_dir, exist_ok=True)
-    out_npy = os.path.join(out_dir, f"{dataset_idx}_{VERTICAL_AGG}.npy")
-    np.save(out_npy, grid_mean)
 
-    fig, ax = plt.subplots(figsize=(6, 6))
-    extent = [-half, half, -half, half]
-    im = ax.imshow(
-        grid_mean,
-        origin="lower",
-        extent=extent,
-        cmap="turbo",
-       # 改成
-        vmin=-10.0,
-        vmax=40.0,
-    )
-    ax.scatter(0.0, 0.0, s=60, c="white", marker="x", linewidths=2, label="Storm center")
-    ax.set_xlabel("X (km)")
-    ax.set_ylabel("Y (km)")
-    ax.set_title(f"zFactorFinal regridded to 5 km ({INTERP_METHOD})")
-    ax.grid(alpha=0.2)
-    fig.colorbar(im, ax=ax, label="zFactorFinal")
-    fig.tight_layout()
-    out_path = os.path.join(_script_dir(), PLOT_OUTPUT)
-    fig.savefig(out_path, dpi=150)
-    plt.close(fig)
-    print(f"Wrote npy: {out_npy}")
-    print(f"Wrote plot: {out_path}")
+    if nw.ndim == 2:
+        grid_nw = _regrid_field(nw, x_km, y_km, valid_xy, swath_mask, step, GRID_SIZE, half)
+        grid_dm = _regrid_field(dm, x_km, y_km, valid_xy, swath_mask, step, GRID_SIZE, half)
+        out = np.stack([grid_nw, grid_dm], axis=0)
+    else:
+        n_bins = nw.shape[2]
+        grid_nw = np.empty((n_bins, GRID_SIZE, GRID_SIZE), dtype=np.float32)
+        grid_dm = np.empty((n_bins, GRID_SIZE, GRID_SIZE), dtype=np.float32)
+        t0 = time.perf_counter()
+        def _regrid_bin(b_idx: int):
+            nw_b = _regrid_field(
+                nw[:, :, b_idx],
+                x_km,
+                y_km,
+                valid_xy,
+                swath_mask,
+                step,
+                GRID_SIZE,
+                half,
+            )
+            dm_b = _regrid_field(
+                dm[:, :, b_idx],
+                x_km,
+                y_km,
+                valid_xy,
+                swath_mask,
+                step,
+                GRID_SIZE,
+                half,
+            )
+            return b_idx, nw_b, dm_b
+
+        if USE_PARALLEL and n_bins > 1:
+            done = 0
+            with ThreadPoolExecutor(max_workers=N_WORKERS) as ex:
+                futures = {ex.submit(_regrid_bin, b): b for b in range(n_bins)}
+                for fut in as_completed(futures):
+                    b_idx, nw_b, dm_b = fut.result()
+                    grid_nw[b_idx] = nw_b
+                    grid_dm[b_idx] = dm_b
+                    done += 1
+                    if PRINT_EVERY_BIN and done % PRINT_EVERY_BIN == 0:
+                        dt = time.perf_counter() - t0
+                        print(f"[{row_idx}] bins {done}/{n_bins} done ({dt:.1f}s)")
+        else:
+            for b in range(n_bins):
+                b_idx, nw_b, dm_b = _regrid_bin(b)
+                grid_nw[b_idx] = nw_b
+                grid_dm[b_idx] = dm_b
+                if PRINT_EVERY_BIN and (b + 1) % PRINT_EVERY_BIN == 0:
+                    dt = time.perf_counter() - t0
+                    print(f"[{row_idx}] bins {b + 1}/{n_bins} done ({dt:.1f}s)")
+        # axis 0: NW (index 0), DM (index 1); axis 1: bin; axes 2-3: grid (y, x)
+        out = np.stack([grid_nw, grid_dm], axis=0)
+
+    out = out.astype(np.float32, copy=False)
+    out_path = _output_path(granule_file, swath)
+    np.save(out_path, out)
+
+    print(f"[{row_idx}] Wrote npy: {out_path}")
     print(f"Granule: {granule_file}")
     print(f"SID: {sid}")
     print(f"Dataset: {data_path}")
+
+
+def main() -> None:
+    if not hasattr(h5py, "File"):
+        raise RuntimeError(
+            "h5py.File is unavailable. This usually means a shadowed h5py module "
+            "or missing h5py install in the current environment."
+        )
+    csv_path = os.path.join(_script_dir(), IN_CSV)
+    df = pd.read_csv(csv_path)
+    if len(df) == 0:
+        raise ValueError(f"{IN_CSV} is empty.")
+
+    if ROW_INDEX is not None:
+        df = df.iloc[[ROW_INDEX]]
+    if ROW_MAX is not None:
+        df = df.iloc[:ROW_MAX]
+
+    error_count = 0
+    for row_idx, row in df.iterrows():
+        try:
+            _process_row(row, row_idx)
+        except Exception as exc:
+            error_count += 1
+            print(f"[{row_idx}] Skipped: {exc}")
+
+    if error_count:
+        print(f"Done with {error_count} row(s) skipped due to errors.")
 
 
 if __name__ == "__main__":

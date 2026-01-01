@@ -171,7 +171,7 @@ def main():
     if not npy_files:
         raise FileNotFoundError("No npy files found in datasets/zFactorFinal.")
 
-    npy_path = npy_files[2]
+    npy_path = npy_files[6]
     data = np.load(npy_path)
     if data.ndim != 2:
         raise ValueError(f"Expected 2D array, got {data.shape} in {npy_path}")

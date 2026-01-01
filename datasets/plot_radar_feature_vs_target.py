@@ -21,7 +21,7 @@ def compute_r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 def main() -> None:
     # Config
     csv_path = Path("gpm_passes_swath_true.csv")
-    target = "delta_24h"
+    target = "intensity_bst"
     feature_prefix = "stormtop_"
     features = None
     outdir = Path("plots_radar_feature_target")
@@ -33,7 +33,7 @@ def main() -> None:
     df = pd.read_csv(csv_path)
     df1 = df.loc[:, 'zFactorFinal_max_r100':]
     feature_cols = [c for c in df1.columns]
-    #df = df[(df['intensity_bst'] > 55) & (df['delta_24h'] > 0)].copy()
+    df = df[(df['intensity_bst'] > 55) & (df['delta_24h'] > 0)].copy()
 
     if target not in df.columns:
         raise ValueError(f"Target column not found: {target}")
